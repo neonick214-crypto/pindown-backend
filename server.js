@@ -1,6 +1,5 @@
 const express = require('express');
 const axios = require('axios');
-const cheerio = require('cheerio');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,9 +13,9 @@ app.use((req, res, next) => {
     next();
 });
 
-// Helper: Resolve pin.it short link (multiple methods)
+// Resolve short link to full URL
 async function resolveShortLink(shortUrl) {
-    // Method 1: oEmbed
+    // oEmbed
     try {
         const oembedUrl = `https://www.pinterest.com/oembed?url=${encodeURIComponent(shortUrl)}`;
         const { data } = await axios.get(oembedUrl, {
@@ -24,11 +23,8 @@ async function resolveShortLink(shortUrl) {
             timeout: 8000
         });
         if (data && data.url) return data.url;
-    } catch (e) {
-        console.log('oEmbed failed, trying redirect...');
-    }
-
-    // Method 2: HTTP redirect
+    } catch (e) {}
+    // HTTP redirect
     try {
         const response = await axios.get(shortUrl, {
             maxRedirects: 5,
@@ -36,85 +32,64 @@ async function resolveShortLink(shortUrl) {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
             timeout: 8000
         });
-        const finalUrl = response.request.res.responseUrl || response.request._redirectable._currentUrl;
+        const finalUrl = response.request.res.responseUrl;
         if (finalUrl && finalUrl.includes('pinterest.com/pin/')) return finalUrl;
-    } catch (e) {
-        console.log('Redirect method failed:', e.message);
-    }
-
-    // Method 3: Try appending https:// if missing
-    if (!shortUrl.startsWith('http')) {
-        return resolveShortLink('https://' + shortUrl);
-    }
-
+    } catch (e) {}
     throw new Error('Could not resolve short link.');
 }
 
-// Helper: Extract video from full Pinterest page
-async function extractVideoFromPage(pageUrl) {
+// Extract Pin ID from URL
+function extractPinId(url) {
+    const match = url.match(/pin\/(\d+)/);
+    return match ? match[1] : null;
+}
+
+// Get video from Pinterest Public API
+async function getVideoFromPinId(pinId) {
+    const apiUrl = `https://api.pinterest.com/v3/pidgets/pins/info/?pin_id=${pinId}`;
     const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
     };
-    const { data } = await axios.get(pageUrl, { headers });
-    const $ = cheerio.load(data);
-
-    // Method 1: JSON-LD
-    const jsonLd = $('script[type="application/ld+json"]').html();
-    if (jsonLd) {
-        try {
-            const parsed = JSON.parse(jsonLd);
-            if (parsed.contentUrl) {
-                return {
-                    video_url: parsed.contentUrl,
-                    thumbnail: parsed.thumbnailUrl || '',
-                    title: parsed.name || 'Pinterest Video'
-                };
+    const { data } = await axios.get(apiUrl, { headers });
+    if (data && data.status === 'success' && data.data) {
+        const pinData = data.data;
+        if (pinData.videos && pinData.videos.video_list) {
+            const videos = pinData.videos.video_list;
+            const qualityOrder = ['V_H264_1080P', 'V_H264_720P', 'V_H264_480P', 'V_H264_360P'];
+            for (const q of qualityOrder) {
+                if (videos[q]) {
+                    return {
+                        video_url: videos[q].url,
+                        thumbnail: pinData.image?.original?.url || '',
+                        title: pinData.description || pinData.title || 'Pinterest Video'
+                    };
+                }
             }
-            if (Array.isArray(parsed) && parsed[0]?.contentUrl) {
-                return {
-                    video_url: parsed[0].contentUrl,
-                    thumbnail: parsed[0].thumbnailUrl || '',
-                    title: parsed[0].name || 'Pinterest Video'
-                };
-            }
-        } catch (e) {}
+            const firstKey = Object.keys(videos)[0];
+            if (firstKey) return {
+                video_url: videos[firstKey].url,
+                thumbnail: pinData.image?.original?.url || '',
+                title: pinData.description || pinData.title || 'Pinterest Video'
+            };
+        }
+        throw new Error('This pin does not contain a video.');
     }
-
-    // Method 2: <video> tag
-    const videoEl = $('video');
-    if (videoEl.length) {
-        const src = videoEl.attr('src') || videoEl.find('source').attr('src');
-        const poster = videoEl.attr('poster');
-        if (src) return {
-            video_url: src,
-            thumbnail: poster || '',
-            title: $('meta[property="og:title"]').attr('content') || 'Pinterest Video'
-        };
-    }
-
-    // Method 3: og:video meta
-    const ogVideo = $('meta[property="og:video"]').attr('content');
-    const ogImage = $('meta[property="og:image"]').attr('content');
-    if (ogVideo) return {
-        video_url: ogVideo,
-        thumbnail: ogImage || '',
-        title: $('meta[property="og:title"]').attr('content') || 'Pinterest Video'
-    };
-
-    throw new Error('No video found on this pin.');
+    throw new Error('Failed to fetch pin data from Pinterest API.');
 }
 
 // Main Route
 app.get('/download', async (req, res) => {
     const pinUrl = req.query.url;
     if (!pinUrl) return res.status(400).json({ error: 'Missing ?url=' });
-
     try {
         let finalUrl = pinUrl;
-        if (pinUrl.includes('pin.it') || pinUrl.includes('pinterest.com/pin/') === false) {
+        if (pinUrl.includes('pin.it')) {
             finalUrl = await resolveShortLink(pinUrl);
         }
-        const videoData = await extractVideoFromPage(finalUrl);
+        const pinId = extractPinId(finalUrl);
+        if (!pinId) throw new Error('Could not extract pin ID.');
+        const videoData = await getVideoFromPinId(pinId);
         res.json({ status: 'success', ...videoData });
     } catch (err) {
         console.error('Extraction error:', err.message);
